@@ -1,93 +1,60 @@
-# run_empty_arena_with_robot.py
-from robosuite.models import MujocoWorldBase
-from robosuite.models.arenas.empty_arena import EmptyArena
-from robosuite.models.robots import Panda
-from robosuite.models.grippers import gripper_factory
-from robosuite.models.objects import BallObject
-from mujoco.viewer import launch, launch_passive
-import mujoco
-from mujoco.viewer import launch
+# run_empty_arena_viewgrab.py  –  save *exactly* what the GUI shows
+import os, xml.etree.ElementTree as ET
+from PIL import Image
 import numpy as np
-import os
+import mujoco
+from mujoco.viewer import launch_passive
+from robosuite.models import MujocoWorldBase, arenas, robots, grippers, objects
 
-# 1) Create the world container
+# -------------------------------------------------------------------- scene
 world = MujocoWorldBase()
+world.merge(arenas.empty_arena.EmptyArena())
 
-# 2) Merge in the empty arena (just the default ground plane)
-arena = EmptyArena()
-world.merge(arena)
-
-# 3) Add the Panda robot + its gripper
-robot   = Panda()
-gripper = gripper_factory("PandaGripper")
-robot.add_gripper(gripper)
-robot.set_base_xpos([0, 0, 0])   # place robot at the world origin
+robot = robots.Panda()
+robot.add_gripper(grippers.gripper_factory("PandaGripper"))        # robosuite API :contentReference[oaicite:2]{index=2}
 world.merge(robot)
 
-# 4) Create and position a single sphere above the ground
-sphere = BallObject(
-    name="sphere",
-    size=[0.04],               # 4 cm radius
-    rgba=[0, 0.5, 0.5, 1]      # teal color
-).get_obj()
-sphere.set("pos", "0.5 0 0.04")  # x=0.5 m in front of robot, z=radius
-world.worldbody.append(sphere)
+ball = objects.BallObject("sphere", size=[0.04], rgba=[0, .5, .5, 1]).get_obj()
+ball.set("pos", "0.5 0 0.04")
+world.worldbody.append(ball)
 
-# 5) Build the native MuJoCo model & state
-model = world.get_model(mode="mujoco")
-data  = mujoco.MjData(model)
+model, data = world.get_model(mode="mujoco"), mujoco.MjData(world.get_model(mode="mujoco"))
 
+viewer = launch_passive(model, data)                                # free camera GUI
 
-# Control the robot
-# 1) Bring up a non-blocking viewer
-viewer = launch_passive(model, data)
+# ---------------------------------------------------------------- helper
+def save_viewer_frame(viewer, model, data, path):
+    """
+    Grab a PNG that matches the on-screen viewer image (camera, overlays, size).
+    Grows the model’s off-screen framebuffer on-the-fly if the window is bigger.
+    """
+    with viewer.lock():                             # thread-safe
+        w, h = viewer.viewport.width, viewer.viewport.height
 
-# 2) Figure out your action dimension (number of actuators)
-act_dim = model.nu   # `nu` is # of control inputs
+        # --- ensure framebuffer ≥ window size (MuJoCo default is 640×480) ---
+        if w > model.vis.global_.offwidth or h > model.vis.global_.offheight:
+            model.vis.global_.offwidth  = max(w, model.vis.global_.offwidth)
+            model.vis.global_.offheight = max(h, model.vis.global_.offheight)
+        # --------------------------------------------------------------------
+        renderer = mujoco.Renderer(model, width=w, height=h)
+        renderer.update_scene(data,
+                              camera=viewer.cam,
+                              scene_option=viewer.opt)   # mirror GUI view
+        Image.fromarray(renderer.render()).save(path)    # save PNG
 
-# 3) Main loop: sample a random vector in [-82,12], send it, step, render
-while data.time < 1000:  # run for 10 seconds
-    random_action = np.random.uniform(-80.0, 80.0, size=act_dim)
-    data.ctrl[:]    = random_action        # send to the robot
-    mujoco.mj_step(model, data)            # advance physics one frame
-    viewer.sync()                          # update the on-screen window
+# ---------------------------------------------------------------- run + dump
+os.makedirs("viewer_frames", exist_ok=True)
+step, every, act_dim = 0, 30, model.nu
 
-
-
-# Add this to your existing code after creating model and data
-def save_frame(model, data, filename, width=640, height=480, camera_id=None):
-    """Save a frame from the simulation"""
-    
-    # Create renderer
-    renderer = mujoco.Renderer(model, height=height, width=width)
-    
-    # Set camera (optional - if None, uses free camera)
-    if camera_id is not None:
-        renderer.update_scene(data, camera=camera_id)
-    else:
-        renderer.update_scene(data)
-    
-    # Render and get pixels
-    pixels = renderer.render()
-    
-    # Convert to PIL Image and save
-    image = Image.fromarray(pixels)
-    image.save(filename)
-    print(f"Frame saved as {filename}")
-
-# Modified main loop with frame saving
-frame_counter = 0
-save_every_n_frames = 30  # Save every 30 frames (adjust as needed)
-
-while data.time < 10:  # run for 10 seconds
-    random_action = np.random.uniform(-80.0, 80.0, size=act_dim)
-    data.ctrl[:] = random_action
+while data.time < 10.0:                                             # 10-second demo
+    data.ctrl[:] = np.random.uniform(-80, 80, act_dim)
     mujoco.mj_step(model, data)
     viewer.sync()
-    
-    # Save frame occasionally
-    if frame_counter % save_every_n_frames == 0:
-        filename = f"frame_{frame_counter:06d}.png"
-        save_frame(model, data, filename)
-    
-    frame_counter += 1
+
+    if step % every == 0:
+        fname = f"viewer_frames/frame_{step:06d}.png"
+        save_viewer_frame(viewer, model, data, fname)
+        print("saved", fname)
+    step += 1
+
+print(f"Finished – {step} sim steps; {(step//every)+1} PNGs in viewer_frames/")
