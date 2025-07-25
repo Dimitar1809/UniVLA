@@ -31,7 +31,7 @@ class OpenVLAController:
     Complete OpenVLA controller that integrates VLA model with robosuite IK control
     """
     
-    def __init__(self, model_name="openvla/openvla-7b", controller_type="IK_POSE"):
+    def __init__(self, model_name="openvla/openvla-7b", controller_type="OSC_POSE"):  # Changed default
         """
         Initialize OpenVLA controller
         
@@ -40,7 +40,7 @@ class OpenVLAController:
             controller_type: Robosuite controller type ("IK_POSE", "OSC_POSE", "WholeBodyIK")
         """
         self.model_name = model_name
-        self.controller_type = controller_type
+        self.controller_type = controller_type  # Now OSC_POSE
         self.step_count = 0
         
         # Initialize model components
@@ -48,9 +48,9 @@ class OpenVLAController:
         self.vla_model = None
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         
-        # Control parameters
-        self.action_scaling = 1000.0  # Scaling factor for VLA actions
-        self.max_action_magnitude = 10.0  # Maximum action magnitude for safety
+        # Control parameters for OSC controller (different from IK!)
+        self.action_scaling = 10.0  # OSC typically uses larger actions than IK
+        self.max_action_magnitude = 0.5  # OSC can handle larger magnitudes
 
         print(f"🤖 Initializing OpenVLA Controller")
         print(f"   Model: {model_name}")
@@ -63,8 +63,10 @@ class OpenVLAController:
     def _load_vla_model(self):
         """Load OpenVLA model and processor"""
         try:
+            # Load model directly
             from transformers import AutoModelForVision2Seq, AutoProcessor
-            
+
+
             print("📦 Loading OpenVLA processor...")
             self.processor = AutoProcessor.from_pretrained(
                 self.model_name, 
@@ -72,13 +74,9 @@ class OpenVLAController:
             )
             
             print("📦 Loading OpenVLA model...")
-            self.vla_model = AutoModelForVision2Seq.from_pretrained(
-                self.model_name,
-                torch_dtype=torch.bfloat16,
-                low_cpu_mem_usage=True,
-                trust_remote_code=True,
-            ).to(self.device)
-            
+            self.vla_model = AutoModelForVision2Seq.from_pretrained("openvla/openvla-7b-finetuned-libero-goal", trust_remote_code=True, torch_dtype="auto")
+            self.vla_model.to(self.device)
+
             print(f"✅ OpenVLA model loaded successfully on {self.device}")
             
         except ImportError as e:
@@ -89,26 +87,23 @@ class OpenVLAController:
             print(f"❌ Failed to load OpenVLA model: {e}")
             raise
 
-    def get_vla_action(self, image, instruction="pick up the cube"):
+    def get_vla_action(self, image, instruction="pick up the cube"):  # Changed default instruction
         """
         Get action prediction from OpenVLA model
-        Enhanced with image processing from separate module
-        
-        Args:
-            image: RGB image as numpy array (H, W, 3) or PIL Image, or None
-            instruction: Task instruction string
-            
-        Returns:
-            numpy array: VLA action [x, y, z, roll, pitch, yaw, gripper]
         """
-        # Handle None image case - return fallback action
         if image is None:
             print("⚠️  No image available - using fallback action")
             return np.array([0.01, 0.0, 0.01, 0.0, 0.0, 0.0, 1.0])
         
         try:
-            # Simplified prompt format
-            prompt = "pick up the cube"
+            # Use proper Libero instruction format
+            libero_instructions = [
+                "pick up the cube",
+                "grasp the cube and lift it up", 
+                "lift the cube off the table"
+            ]
+            
+            prompt = libero_instructions[0]  # Use the first instruction
             print(f"🎯 Using instruction: '{prompt}'")
             
             # Process image using our image utilities
@@ -132,14 +127,14 @@ class OpenVLAController:
             
             print("After processing inputs, running inference...")
 
-            # Use bridge_orig as the primary normalization (best for manipulation tasks)
+            # Use ONLY libero_goal normalization (the only one available)
             with torch.no_grad():
                 action = self.vla_model.predict_action(
                     **inputs, 
-                    unnorm_key="bridge_orig",  # Use BridgeData normalization
+                    unnorm_key="libero_goal",  # This is the ONLY option for Libero model
                     do_sample=False
                 )
-        
+    
             print("VLA inference completed successfully")
 
             # Convert to numpy if needed
@@ -159,38 +154,40 @@ class OpenVLAController:
     
     def convert_vla_to_robosuite_action(self, vla_action):
         """
-        Convert VLA output to robosuite IK controller input with enhanced debugging
+        Convert VLA output to robosuite OSC controller input - LIBERO STYLE
         """
         # Extract position and orientation deltas
         position_delta = vla_action[:3]      # [dx, dy, dz]
         orientation_delta = vla_action[3:6]  # [droll, dpitch, dyaw]
         
-        # Debug: Check if actions are too small
-        pos_mag = np.linalg.norm(position_delta)
-        rot_mag = np.linalg.norm(orientation_delta)
-        
-        if self.step_count % 20 == 0:
-            print(f"🔧 Action Conversion Debug (Step {self.step_count}):")
-            print(f"   Position magnitude: {pos_mag:.6f}")
-            print(f"   Rotation magnitude: {rot_mag:.6f}")
-            print(f"   Current scaling: {self.action_scaling}")
-            print(f"   Max magnitude limit: {self.max_action_magnitude}")
-        
-        # Combine into 6D action for IK controller
+        # For OSC controller, use much less aggressive scaling
+        # Based on OpenVLA LIBERO evaluation, they might use direct scaling
         ik_action = np.concatenate([position_delta, orientation_delta])
         
-        # Apply scaling
-        ik_action_scaled = ik_action * self.action_scaling
+        # OSC controller scaling (less aggressive than IK)
+        if self.controller_type == "OSC_POSE":
+            # Scale similar to what OpenVLA LIBERO uses
+            ik_action_scaled = ik_action * 0.2  # Modest scaling for OSC
+        else:
+            # Fallback for IK
+            action_magnitude = np.linalg.norm(ik_action)
+            if action_magnitude > 0.001:
+                target_magnitude = 0.03
+                scaling_factor = target_magnitude / action_magnitude
+                ik_action_scaled = ik_action * scaling_factor
+            else:
+                ik_action_scaled = ik_action
+    
+        # OSC controllers can handle larger actions
+        ik_action_final = np.clip(ik_action_scaled, -0.3, 0.3)
         
-        # Clip to safe ranges
-        ik_action_final = np.clip(ik_action_scaled, -self.max_action_magnitude, self.max_action_magnitude)
-        
-        # Check if clipping is happening (which might indicate actions are too large)
         if self.step_count % 20 == 0:
-            clipped = not np.allclose(ik_action_scaled, ik_action_final)
-            if clipped:
-                print(f"   ⚠️  Action was clipped! Scaled: {ik_action_scaled}")
-                print(f"   ⚠️  After clipping: {ik_action_final}")
+            print(f"🔧 OSC Action Conversion (Step {self.step_count}):")
+            print(f"   Controller type: {self.controller_type}")
+            print(f"   VLA action: {ik_action}")
+            print(f"   Scaled action: {ik_action_scaled}")
+            print(f"   Final action: {ik_action_final}")
+            print(f"   Final magnitude: {np.linalg.norm(ik_action_final):.6f}")
         
         return ik_action_final
     
@@ -237,15 +234,13 @@ class OpenVLAController:
 
 def create_robosuite_env_with_cameras():
     """
-    Create robosuite environment with proper camera configuration
-    
-    Returns:
-        tuple: (env, has_cameras) where env is the raw environment (NOT wrapped) and has_cameras is bool
+    Create robosuite environment matching OpenVLA LIBERO evaluation setup
     """
     from robosuite.controllers.parts.controller_factory import load_part_controller_config
     from robosuite.controllers.composite.composite_controller_factory import refactor_composite_controller_config
     
-    controller_type = "IK_POSE"
+    # USE OSC CONTROLLER (like OpenVLA LIBERO evaluation)
+    controller_type = "OSC_POSE"  # Changed from "IK_POSE" to "OSC_POSE"
     control_freq = 20
     
     print(f"   Loading {controller_type} controller configuration...")
@@ -271,9 +266,9 @@ def create_robosuite_env_with_cameras():
         
         # Create raw environment WITHOUT GymWrapper to preserve camera observations
         raw_env = suite.make(
-            env_name="Lift",
+            env_name="Lift",  # Use Lift task like LIBERO
             robots="Panda",
-            controller_configs=controller_config,
+            controller_configs=controller_config,  # Now using OSC_POSE
             has_renderer=True,
             render_camera="frontview",
             has_offscreen_renderer=True,        # Critical for camera observations
