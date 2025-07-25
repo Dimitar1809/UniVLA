@@ -429,12 +429,12 @@ def main():
 
 if __name__ == "__main__":
     main()
-        
+
         # PLACEHOLDER: Your actual model output
         # Based on your example: [-0.00848473, 0.01025995, -0.00102072, 0.01135582, 0.00323859, -0.0065139, 0.0000]
-        vla_output = np.array([-0.00848473, 0.01025995, -0.00102072, 0.01135582, 0.00323859, -0.0065139, 0.0000])
+    vla_output = np.array([-0.00848473, 0.01025995, -0.00102072, 0.01135582, 0.00323859, -0.0065139, 0.0000])
         
-        return vla_output
+        #return vla_output
     
     def _prepare_observation_for_vla(self, obs):
         """
@@ -478,7 +478,7 @@ def main():
         robots="Panda",
         has_renderer=True,
         render_camera="frontview",
-        has_offscreen_renderer=False,
+        has_offscreen_renderer=True,
         use_camera_obs=True,  # Important: VLA needs visual input
         camera_names=["frontview"],  # Specify camera for VLA
         camera_heights=224,   # Standard size for vision models

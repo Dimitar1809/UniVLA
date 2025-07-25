@@ -29,8 +29,17 @@ class DummyVLAController:
     def get_vla_action(self, image, instruction="pick up the cube"):
         """
         Return dummy VLA action for testing
-        Uses your example output with some variation
+        Works with or without image input for testing flexibility
         """
+        # Note: In a real VLA, the image would be processed here
+        if image is not None and hasattr(image, 'shape'):
+            # Simulate image processing (in real VLA this would be neural network inference)
+            pass
+        else:
+            # No image available - use state-based heuristics
+            if self.step_count == 0:
+                print("   🤖 VLA running without visual input (state-based mode)")
+        
         # Base action (your example)
         base_action = np.array([-0.00848473, 0.01025995, -0.00102072, 
                                0.01135582, 0.00323859, -0.0065139, 0.0000])
@@ -141,29 +150,93 @@ def test_integration():
             part_controller_config, robot_type="Panda", arms=["right"]
         )
         
-        # Create environment
-        raw_env = suite.make(
-            env_name="PickPlace",
-            robots="Panda",
-            controller_configs=controller_config,
-            has_renderer=True,
-            render_camera="frontview",
-            has_offscreen_renderer=True,        # Enable offscreen renderer for camera obs
-            control_freq=control_freq,
-            horizon=1000,
-            use_object_obs=True,
-            use_camera_obs=True,                # Camera observations for VLA
-            camera_names=["frontview", "agentview"],
-            camera_heights=256,
-            camera_widths=256,
-            reward_shaping=True,
-        )
+        # Create environment with WSL-compatible settings
+        print("   Configuring for WSL environment with GPU support...")
+        
+        # Set environment variables for rendering
+        import os
+        
+        try:
+            print("   Attempting to create environment with camera observations...")
+            
+            # First try: GPU acceleration with permissions workaround
+            os.environ['MUJOCO_GL'] = 'egl'
+            os.environ['EGL_DEVICE_ID'] = '0'
+            
+            raw_env = suite.make(
+                env_name="PickPlace",
+                robots="Panda",
+                controller_configs=controller_config,
+                has_renderer=True,
+                render_camera="frontview",
+                has_offscreen_renderer=True,        # Enable offscreen renderer for camera obs
+                control_freq=control_freq,
+                horizon=1000,
+                use_object_obs=True,
+                use_camera_obs=True,                # Camera observations for VLA
+                camera_names=["frontview", "agentview"],
+                camera_heights=256,
+                camera_widths=256,
+                reward_shaping=True,
+                render_gpu_device_id=0,            # Explicitly use GPU 0
+            )
+            print("✅ Created environment with GPU acceleration and camera support")
+            
+        except Exception as gpu_error:
+            print(f"⚠️  GPU rendering failed: {type(gpu_error).__name__}")
+            print("   Trying software rendering fallback...")
+            
+            try:
+                # Second try: Software rendering
+                os.environ['MUJOCO_GL'] = 'osmesa'
+                
+                raw_env = suite.make(
+                    env_name="PickPlace",
+                    robots="Panda",
+                    controller_configs=controller_config,
+                    has_renderer=True,
+                    render_camera="frontview",
+                    has_offscreen_renderer=True,
+                    control_freq=control_freq,
+                    horizon=1000,
+                    use_object_obs=True,
+                    use_camera_obs=True,
+                    camera_names=["frontview", "agentview"],
+                    camera_heights=256,
+                    camera_widths=256,
+                    reward_shaping=True,
+                )
+                print("✅ Created environment with software rendering and camera support")
+                
+            except Exception as software_error:
+                print(f"⚠️  Software rendering also failed: {type(software_error).__name__}")
+                print("   Using no-rendering mode (state-based only)...")
+                
+                # Third try: No rendering (state observations only)
+                raw_env = suite.make(
+                    env_name="PickPlace",
+                    robots="Panda",
+                    controller_configs=controller_config,
+                    has_renderer=False,              # Disable all rendering
+                    has_offscreen_renderer=False,    # Disable offscreen renderer
+                    control_freq=control_freq,
+                    horizon=1000,
+                    use_object_obs=True,
+                    use_camera_obs=False,            # No camera observations
+                    reward_shaping=True,
+                )
+                print("✅ Created environment without rendering (state-based only)")
+                print("   Note: VLA will use dummy actions since no camera input is available")
         
         env = GymWrapper(raw_env)
         robot = env.env.robots[0]
         arm = robot.arms[0]
         
+        # Check if rendering is available
+        has_rendering = hasattr(env.env, 'viewer') and env.env.viewer is not None
+        
         print("✅ Environment created successfully")
+        print(f"   Rendering available: {has_rendering}")
         print("📊 Action Space Information:")
         robot.print_action_info()
         
@@ -188,25 +261,38 @@ def test_integration():
                 print(f"📊 Observation keys: {list(obs.keys())}")
                 image_keys = [k for k in obs.keys() if "image" in k]
                 print(f"📷 Available cameras: {image_keys}")
+            elif isinstance(obs, tuple):
+                # GymWrapper sometimes returns tuple - extract the actual observation
+                actual_obs = obs[0] if len(obs) > 0 else {}
+                print(f"📊 Actual observation type: {type(actual_obs)}")
+                if isinstance(actual_obs, dict):
+                    print(f"📊 Actual observation keys: {list(actual_obs.keys())}")
+                    image_keys = [k for k in actual_obs.keys() if "image" in k]
+                    print(f"📷 Available cameras: {image_keys}")
+                obs = actual_obs  # Use the actual observation dict for processing
             
             while not done and step < max_steps_per_episode:
-                # Get camera image 
+                # Get camera image (if available)
                 image = None
-                if isinstance(obs, dict):
-                    if "frontview_image" in obs:
-                        image = obs["frontview_image"]
-                    elif "agentview_image" in obs:
-                        image = obs["agentview_image"]
-                    else:
-                        # Find any image observation
-                        image_keys = [k for k in obs.keys() if "image" in k]
-                        if image_keys:
-                            image = obs[image_keys[0]]
-                            print(f"📷 Using camera: {image_keys[0]}")
-                else:
-                    print(f"⚠️  Unexpected obs type: {type(obs)}")
+                camera_available = False
                 
-                # Get dummy VLA action
+                if isinstance(obs, dict):
+                    image_keys = [k for k in obs.keys() if "image" in k]
+                    if image_keys:
+                        camera_available = True
+                        if "frontview_image" in obs:
+                            image = obs["frontview_image"]
+                        elif "agentview_image" in obs:
+                            image = obs["agentview_image"]
+                        else:
+                            image = obs[image_keys[0]]
+                            if step == 0:  # Only print once per episode
+                                print(f"📷 Using camera: {image_keys[0]}")
+                    else:
+                        if step == 0:  # Only print once per episode
+                            print("📷 No camera observations available - using state-based control")
+                
+                # Get dummy VLA action (works with or without image)
                 vla_action = vla_controller.get_vla_action(image)
                 
                 # Convert to robosuite action
@@ -232,8 +318,13 @@ def test_integration():
                 # Update controller
                 vla_controller.update_step_count()
                 
-                # Render
-                env.render()
+                # Render only if available
+                if has_rendering:
+                    try:
+                        env.render()
+                    except Exception as render_error:
+                        if step == 1:  # Only print once per episode
+                            print(f"⚠️  Rendering failed: {render_error}")
                 
                 # Print progress
                 if reward > 0:
@@ -242,9 +333,17 @@ def test_integration():
                     print(f"📊 Step {step}: Reward = {reward:.3f} (Total: {total_reward:.3f})")
                 
                 # Print end-effector position occasionally
-                if step % 50 == 0 and "robot0_eef_pos" in obs:
-                    ee_pos = obs["robot0_eef_pos"]
-                    print(f"   EE Position: [{ee_pos[0]:.3f}, {ee_pos[1]:.3f}, {ee_pos[2]:.3f}]")
+                if step % 50 == 0:
+                    ee_pos = None
+                    if isinstance(obs, dict) and "robot0_eef_pos" in obs:
+                        ee_pos = obs["robot0_eef_pos"]
+                    elif hasattr(obs, 'get'):
+                        ee_pos = obs.get("robot0_eef_pos")
+                    
+                    if ee_pos is not None:
+                        print(f"   EE Position: [{ee_pos[0]:.3f}, {ee_pos[1]:.3f}, {ee_pos[2]:.3f}]")
+                    else:
+                        print(f"   Step {step}: Continuing (no EE position available)")
                 
                 # Small delay for visualization
                 time.sleep(0.05)  # Slightly slower for testing
